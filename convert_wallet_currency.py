@@ -2,25 +2,32 @@
 from __future__ import annotations
 
 import argparse
-import csv
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from wallet_tabular import (
+    SUPPORTED_OUTPUT_FORMATS,
+    discover_directory_inputs,
+    read_rows,
+    resolve_output_format,
+    validate_explicit_inputs,
+    write_rows,
+)
 
 
-DEFAULT_SOURCE_DIR = Path("Accounts Data")
+DEFAULT_SOURCE_DIR = Path("Account Data")
 DEFAULT_SOURCE_CURRENCY = "BGN"
 DEFAULT_TARGET_CURRENCY = "EUR"
 DEFAULT_RATE = Decimal("1.95583")
-REQUIRED_HEADERS = {"currency", "amount", "ref_currency_amount"}
+REQUIRED_HEADERS = {"currency", "income_amount", "expense_amount", "ref_currency_amount"}
 MAX_LOGGED_UNEXPECTED_ROWS = 5
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert Wallet CSV files from one currency to another by reading all CSV "
-            "files from a source directory and writing converted copies to a separate "
-            "output directory."
+            "Convert Wallet tabular files from one currency to another by reading "
+            "supported input files (.csv or .xlsx) from a source directory and "
+            "writing converted output files to a separate output directory."
         )
     )
     parser.add_argument(
@@ -28,14 +35,17 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         type=Path,
         default=DEFAULT_SOURCE_DIR,
-        help="Source directory containing Wallet-style CSV files, or a single CSV file.",
+        help=(
+            "Source directory containing Wallet-style .csv/.xlsx files, or a single "
+            "supported input file."
+        ),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         help=(
             "Directory for converted files. Defaults to "
-            "'Accounts Data <TARGET_CURRENCY>'."
+            "'Account Data <TARGET_CURRENCY>'."
         ),
     )
     parser.add_argument(
@@ -74,6 +84,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print what would change without creating or overwriting any files.",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=SUPPORTED_OUTPUT_FORMATS,
+        default="csv",
+        help=(
+            "Generated file format. Defaults to csv. Use xlsx for Excel output, "
+            "or match-input to mirror each source file's format."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,49 +130,39 @@ def normalize_amount(value: str, scale: int) -> str:
     return format_decimal(decimal_value, scale)
 
 
-def discover_input_files(source: Path) -> list[Path]:
+def discover_input_files(source: Path) -> tuple[list[Path], list[str]]:
     if not source.exists():
         raise FileNotFoundError(f"Source path not found: {source}")
 
     if source.is_file():
-        if source.suffix.lower() != ".csv":
-            raise ValueError(f"Source file is not a CSV file: {source}")
-        return [source]
+        return validate_explicit_inputs([source]), []
 
     if not source.is_dir():
-        raise ValueError(f"Source path must be a directory or a CSV file: {source}")
+        raise ValueError(
+            f"Source path must be a directory or a supported input file: {source}"
+        )
 
-    files = sorted(path for path in source.iterdir() if path.is_file() and path.suffix.lower() == ".csv")
-    if not files:
-        raise FileNotFoundError(f"No CSV files found in source directory: {source}")
-    return files
-
-
-def validate_headers(fieldnames: list[str] | None, source: Path) -> list[str]:
-    if not fieldnames:
-        raise ValueError(f"{source} has no header row")
-
-    actual = list(fieldnames)
-    missing = REQUIRED_HEADERS.difference(actual)
-    if missing:
-        missing_list = ", ".join(sorted(missing))
-        raise ValueError(f"{source} is missing required headers: {missing_list}")
-    return actual
+    return discover_directory_inputs(source)
 
 
 def default_output_dir(target_currency: str) -> Path:
-    return Path(f"Accounts Data {target_currency}")
+    return Path(f"Account Data {target_currency}")
 
 
-def output_path_for(input_file: Path, output_dir: Path) -> Path:
-    return output_dir / input_file.name
+def output_path_for(input_file: Path, output_dir: Path, output_format: str) -> Path:
+    extension = resolve_output_format(output_format, input_file.suffix.lower())
+    return output_dir / f"{input_file.stem}.{extension}"
 
 
 def summarize_unexpected_row(row_number: int, row: dict[str, str]) -> str:
     account = (row.get("account") or "").strip() or "<no account>"
     date = (row.get("date") or "").strip() or "<no date>"
     currency = (row.get("currency") or "").strip() or "<empty>"
-    amount = (row.get("amount") or "").strip() or "<empty>"
+    amount = (
+        (row.get("income_amount") or "").strip()
+        or (row.get("expense_amount") or "").strip()
+        or "<empty>"
+    )
     return (
         f"row {row_number}: currency={currency}, amount={amount}, "
         f"account={account}, date={date}"
@@ -171,21 +180,18 @@ def inspect_file(
     unexpected_rows: list[str] = []
     unexpected_count = 0
 
-    with input_path.open("r", newline="", encoding="utf-8-sig") as source_file:
-        reader = csv.DictReader(source_file, delimiter=";")
-        validate_headers(reader.fieldnames, input_path)
-
-        for row in reader:
-            row_count += 1
-            currency = (row.get("currency") or "").strip()
-            if currency == source_currency:
-                converted_rows += 1
-            elif currency == target_currency:
-                normalized_rows += 1
-            else:
-                unexpected_count += 1
-                if len(unexpected_rows) < MAX_LOGGED_UNEXPECTED_ROWS:
-                    unexpected_rows.append(summarize_unexpected_row(row_count + 1, row))
+    _, rows = read_rows(input_path, REQUIRED_HEADERS)
+    for row in rows:
+        row_count += 1
+        currency = (row.get("currency") or "").strip()
+        if currency == source_currency:
+            converted_rows += 1
+        elif currency == target_currency:
+            normalized_rows += 1
+        else:
+            unexpected_count += 1
+            if len(unexpected_rows) < MAX_LOGGED_UNEXPECTED_ROWS:
+                unexpected_rows.append(summarize_unexpected_row(row_count + 1, row))
 
     return converted_rows, normalized_rows, row_count, unexpected_rows, unexpected_count
 
@@ -205,41 +211,54 @@ def process_file(
     unexpected_rows: list[str] = []
     unexpected_count = 0
 
-    with input_path.open("r", newline="", encoding="utf-8-sig") as source_file:
-        reader = csv.DictReader(source_file, delimiter=";")
-        fieldnames = validate_headers(reader.fieldnames, input_path)
+    fieldnames, rows = read_rows(input_path, REQUIRED_HEADERS)
+    for row in rows:
+        row_count += 1
+        currency = (row.get("currency") or "").strip()
 
-        with output_path.open("w", newline="", encoding="utf-8-sig") as target_file:
-            writer = csv.DictWriter(
-                target_file,
-                fieldnames=fieldnames,
-                delimiter=";",
-                quoting=csv.QUOTE_MINIMAL,
+        if currency == source_currency:
+            row["income_amount"] = convert_amount(
+                row["income_amount"], rate, scale
             )
-            writer.writeheader()
+            row["expense_amount"] = convert_amount(
+                row["expense_amount"], rate, scale
+            )
+            row["ref_currency_amount"] = convert_amount(
+                row["ref_currency_amount"], rate, scale
+            )
+            row["currency"] = target_currency
+            converted_rows += 1
+        elif not keep_ref_amounts and currency == target_currency:
+            if row.get("income_amount"):
+                row["income_amount"] = normalize_amount(
+                    row["income_amount"], scale
+                )
+            if row.get("expense_amount"):
+                row["expense_amount"] = normalize_amount(
+                    row["expense_amount"], scale
+                )
+            reference_source = (
+                row.get("income_amount")
+                or row.get("expense_amount")
+                or row.get("ref_currency_amount", "")
+            )
+            row["ref_currency_amount"] = normalize_amount(
+                reference_source, scale
+            )
+            normalized_rows += 1
+        elif currency != target_currency:
+            unexpected_count += 1
+            if len(unexpected_rows) < MAX_LOGGED_UNEXPECTED_ROWS:
+                unexpected_rows.append(
+                    summarize_unexpected_row(row_count + 1, row)
+                )
 
-            for row in reader:
-                row_count += 1
-                currency = (row.get("currency") or "").strip()
-
-                if currency == source_currency:
-                    row["amount"] = convert_amount(row["amount"], rate, scale)
-                    row["ref_currency_amount"] = convert_amount(
-                        row["ref_currency_amount"], rate, scale
-                    )
-                    row["currency"] = target_currency
-                    converted_rows += 1
-                elif not keep_ref_amounts and currency == target_currency:
-                    row["ref_currency_amount"] = normalize_amount(row["amount"], scale)
-                    normalized_rows += 1
-                elif currency != target_currency:
-                    unexpected_count += 1
-                    if len(unexpected_rows) < MAX_LOGGED_UNEXPECTED_ROWS:
-                        unexpected_rows.append(
-                            summarize_unexpected_row(row_count + 1, row)
-                        )
-
-                writer.writerow(row)
+    write_rows(
+        output_path,
+        fieldnames,
+        rows,
+        output_path.suffix.lower().lstrip("."),
+    )
 
     return converted_rows, normalized_rows, row_count, unexpected_rows, unexpected_count
 
@@ -249,7 +268,9 @@ def main() -> int:
     if args.rate <= 0:
         raise ValueError("rate must be greater than zero")
 
-    input_files = discover_input_files(args.source)
+    input_files, skipped_messages = discover_input_files(args.source)
+    for message in skipped_messages:
+        print(message)
     output_dir = args.output_dir or default_output_dir(args.target_currency)
     if args.dry_run:
         if output_dir.exists():
@@ -270,7 +291,7 @@ def main() -> int:
     total_unexpected = 0
 
     for input_file in input_files:
-        output_file = output_path_for(input_file, output_dir)
+        output_file = output_path_for(input_file, output_dir, args.output_format)
         if args.dry_run:
             (
                 converted_rows,
